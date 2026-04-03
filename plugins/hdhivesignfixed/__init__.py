@@ -43,11 +43,11 @@ class HdhiveSignFixed(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/AisenCode/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.0.0"
     # 插件作者
-    plugin_author = "madrays,EchoCC"
+    plugin_author = "madrays,AisenCode"
     # 作者主页
-    author_url = "https://github.com/madrays"
+    author_url = "https://github.com/AisenCode"
     # 插件配置项ID前缀
     plugin_config_prefix = "hdhivesignfixed_"
     # 加载顺序
