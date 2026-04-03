@@ -11,7 +11,7 @@
 - 默认使用代理访问
 
 修改记录:
-- v1.0.0: 首次发布,修复签到失效，加入赌狗签到功能。原作者厂库https://github.com/madrays/MoviePilot-Plugins/，如有请侵权联系删除
+- v1.0.0: 首次发布,修复签到失效，加入赌狗签到功能。原作者仓库https://github.com/madrays/MoviePilot-Plugins/，如有请侵权联系删除
 """
 import time
 import requests
