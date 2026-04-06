@@ -12,6 +12,7 @@
 
 修改记录:
 - v1.0.0: 首次发布,修复签到失效，加入赌狗签到功能。原作者仓库https://github.com/madrays/MoviePilot-Plugins/，如有请侵权联系删除
+- v1.0.1: 兼容赌狗签到可能负分
 """
 import time
 import requests
@@ -43,7 +44,7 @@ class HdhiveSignFixed(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/AisenCode/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "madrays,AisenCode"
     # 作者主页
@@ -292,7 +293,7 @@ class HdhiveSignFixed(_PluginBase):
                 }
                 
                 # 解析奖励积分
-                points_match = re.search(r'获得 (\d+) 积分', message)
+                points_match = re.search(r'获得 (-?\d+) 积分', message)
                 sign_dict['points'] = int(points_match.group(1)) if points_match else "—"
 
                 self._save_sign_history(sign_dict)
@@ -332,7 +333,7 @@ class HdhiveSignFixed(_PluginBase):
                                 "degflag": self._degflag,   #赌狗签到标识
                             }
                             # 解析奖励积分
-                            points_match = re.search(r'获得 (\d+) 积分', message2 or "")
+                            points_match = re.search(r'获得 (-?\d+) 积分', message2 or "")
                             sign_dict['points'] = int(points_match.group(1)) if points_match else "—"
                             self._save_sign_history(sign_dict)
                             self._send_sign_notification(sign_dict)

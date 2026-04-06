@@ -3,13 +3,14 @@
     "name": "影巢签到修复版",
     "description": "自动完成影巢每日签到，赌狗签到，支持失败重试和历史记录",
     "labels": "签到,影巢",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "https://raw.githubusercontent.com/AisenCode/MoviePilot-Plugins/main/icons/hdhive.ico",
     "author": "madrays,AisenCode",
     "level": 2,
     "v2": true,
     "history": {
-      "v1.0": "首次发布,修复签到失效，加入赌狗签到功能。原作者仓库https://github.com/madrays/MoviePilot-Plugins/，如有请侵权联系删除"
+      "v1.0.0": "首次发布,修复签到失效，加入赌狗签到功能。原作者仓库https://github.com/madrays/MoviePilot-Plugins/，如有请侵权联系删除",
+      "v1.0.1": "兼容赌狗签到可能负分"
     }
   }
 }
