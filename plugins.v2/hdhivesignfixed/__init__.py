@@ -13,6 +13,7 @@
 修改记录:
 - v1.0.0: 首次发布,修复签到失效，加入赌狗签到功能。原作者仓库https://github.com/madrays/MoviePilot-Plugins/，如有请侵权联系删除
 - v1.0.1: 兼容赌狗签到可能负分
+- v1.0.2: 修复next-action获取逻辑
 """
 import time
 import requests
@@ -44,7 +45,7 @@ class HdhiveSignFixed(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/AisenCode/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "madrays,AisenCode"
     # 作者主页
@@ -579,7 +580,7 @@ class HdhiveSignFixed(_PluginBase):
             import re
             from urllib.parse import urljoin
             
-            script_pattern = r'"(/_next/static/chunks/[a-fA-F0-9]{16}\.js)\\"'
+            script_pattern = r'self\.__next_f\.push[^"]*"([^"]*\.js)"'
             scripts = re.findall(script_pattern, response.text)
             
             if not scripts:

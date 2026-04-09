@@ -13,6 +13,7 @@
 修改记录:
 - v1.0.0: 首次发布,修复签到失效，加入赌狗签到功能。原作者仓库https://github.com/madrays/MoviePilot-Plugins/，如有请侵权联系删除
 - v1.0.1: 兼容赌狗签到可能负分
+- v1.0.2: 修复next-action获取逻辑
 """
 import time
 import requests
@@ -575,11 +576,10 @@ class HdhiveSignFixed(_PluginBase):
                 logger.warning(f"获取主页失败，使用默认next-action:, 状态码：{response.status_code}")
                 return defuault_next_action
             
-            # 解析HTML，查找所有 _next/static/chunks/ 的script标签
+            # 解析HTML，查找所有script标签
             import re
             from urllib.parse import urljoin
-            
-            script_pattern = r'"(/_next/static/chunks/[a-fA-F0-9]{16}\.js)\\"'
+            script_pattern = r'self\.__next_f\.push[^"]*"([^"]*\.js)"'
             scripts = re.findall(script_pattern, response.text)
             
             if not scripts:
@@ -601,7 +601,7 @@ class HdhiveSignFixed(_PluginBase):
                     )
                     logger.debug(f"js路径： {js_url}，状态码： {js_response.status_code}，响应内容： {js_response.text}")
                     if js_response.status_code == 200:
-                        # 查找包含 checkIn 的 createServerReference 调用
+                        # 查找包含 checkIn 的 createServerReference 调用   S.createServerReference)("402b7e1f30165a6ded288e0043f2dbb11db4a998a1", S.callServer, void 0, S.findSourceMapURL, "checkIn");
                         pattern = r'createServerReference\)\("([a-fA-F0-9]{42})"[^)]*?"checkIn"\)'
                         matches = re.findall(pattern, js_response.text)
                         
