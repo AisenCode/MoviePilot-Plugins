@@ -593,7 +593,7 @@ class HdhiveSignFixed(_PluginBase):
             
             # 逐个检查JS文件内容
             for script_src in all_js_paths:
-                js_url = self._base_url+"/_next/"+ script_src
+                js_url = urljoin(self._base_url+"/_next/",script_src)
                 
                 try:
                     js_response = requests.get(
