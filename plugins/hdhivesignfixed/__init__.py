@@ -45,7 +45,7 @@ class HdhiveSignFixed(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/AisenCode/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "madrays,AisenCode"
     # 作者主页
@@ -303,7 +303,11 @@ class HdhiveSignFixed(_PluginBase):
             else:
                 # 签到失败, a real failure that needs retry
                 logger.error(f"影巢签到失败: {message}")
-
+                #删除缓存字段,好重新获取
+                if hasattr(self, '_next_action_cache'):
+                    delattr(self, '_next_action_cache')
+                if hasattr(self, '_next_action_cache_time'):
+                    delattr(self, '_next_action_cache_time')
                 # 检测鉴权失败，尝试自动登录刷新 Cookie 后重试一次
                 if any(k in (message or "") for k in ["未配置Cookie", "缺少'token'", "未授权", "Unauthorized", "token", "csrf", "登录已过期", "过期", "expired"]):
                     logger.info("检测到Cookie或鉴权问题，尝试自动登录刷新Cookie后重试一次")
@@ -370,11 +374,7 @@ class HdhiveSignFixed(_PluginBase):
                         text=f"❌ 签到失败: {message}，所有重试均已失败"
                     )
                     notification_sent = True
-                    #删除缓存字段,好重新获取
-                    if hasattr(self, '_next_action_cache'):
-                        delattr(self, '_next_action_cache')
-                    if hasattr(self, '_next_action_cache_time'):
-                        delattr(self, '_next_action_cache_time')
+
 
                 return sign_dict
         
@@ -485,7 +485,7 @@ class HdhiveSignFixed(_PluginBase):
                 if signin_res.encoding is None or signin_res.encoding.lower() in ['iso-8859-1', 'windows-1252']:
                     signin_res.encoding = 'utf-8'
                 response_text = signin_res.text
-                logger.debug(f"签到 请求地址：{referer},headers: {str(headers)},HTTP状态码: {signin_res.status_code},返回：{response_text}")
+                #logger.debug(f"签到 请求地址：{referer},headers: {str(headers)},HTTP状态码: {signin_res.status_code},返回：{response_text}")
                 # 处理新的响应格式：
                 # 成功格式：0:{"a":"$@1","f":"","b":"","q":"","i":false}
                 #           1:{"response":{"success":true,"message":"签到成功","code":"200"}}
@@ -554,7 +554,7 @@ class HdhiveSignFixed(_PluginBase):
 
     def _get_next_action(self, cookies, token):
         """动态获取 next-action 值"""
-        defuault_next_action = "40efbc107064215e9eff178b0466274739ba7d9cb4"
+        defuault_next_action = ""
         try:
             # 获取主页HTML
             headers = {
@@ -564,7 +564,7 @@ class HdhiveSignFixed(_PluginBase):
             }
             
             response = requests.get(
-                url=self._base_url,
+                url=self._base_url+"/manager/account",
                 headers=headers,
                 cookies=cookies,
                 proxies=settings.PROXY,
@@ -576,19 +576,24 @@ class HdhiveSignFixed(_PluginBase):
                 logger.warning(f"获取主页失败，使用默认next-action:, 状态码：{response.status_code}")
                 return defuault_next_action
             
-            # 解析HTML，查找所有script标签
+            # 解析HTML，查找所有 _next/static/chunks/ 的script标签
             import re
             from urllib.parse import urljoin
-            script_pattern = r'self\.__next_f\.push[^"]*"([^"]*\.js)"'
-            scripts = re.findall(script_pattern, response.text)
-            
-            if not scripts:
+           
+            script_pattern = r'"([^"]*\.js)"'
+            # 先找到所有 self.__next_f.push 的内容
+            push_blocks = re.findall(r'self\.__next_f\.push\(\[.*?"(.*?)"\]\)',response.text,re.S)
+            all_text = "\n".join(push_blocks)
+            js_files = set(re.findall(r'[\w/\-\.]+\.js', all_text))
+            all_js_paths = sorted(js_files)
+            logger.debug(f"all_js_paths: {all_js_paths}")
+            if not all_js_paths:
                 logger.warning("未找到chunks脚本，使用默认next-action")
                 return defuault_next_action
             
             # 逐个检查JS文件内容
-            for script_src in scripts:
-                js_url = urljoin(self._base_url, script_src)
+            for script_src in all_js_paths:
+                js_url = self._base_url+"/_next/"+ script_src
                 
                 try:
                     js_response = requests.get(
@@ -599,9 +604,9 @@ class HdhiveSignFixed(_PluginBase):
                         timeout=30,
                         verify=False
                     )
-                    logger.debug(f"js路径： {js_url}，状态码： {js_response.status_code}，响应内容： {js_response.text}")
+                    logger.debug(f"js路径： {js_url}，状态码： {js_response.status_code}")
                     if js_response.status_code == 200:
-                        # 查找包含 checkIn 的 createServerReference 调用   S.createServerReference)("402b7e1f30165a6ded288e0043f2dbb11db4a998a1", S.callServer, void 0, S.findSourceMapURL, "checkIn");
+                        # 查找包含 checkIn 的 createServerReference 调用
                         pattern = r'createServerReference\)\("([a-fA-F0-9]{42})"[^)]*?"checkIn"\)'
                         matches = re.findall(pattern, js_response.text)
                         
@@ -633,9 +638,10 @@ class HdhiveSignFixed(_PluginBase):
         
         # 动态获取
         next_action = self._get_next_action(cookies, token)
-        # 更新缓存
-        self._next_action_cache = next_action
-        self._next_action_cache_time = time.time()
+        if next_action:
+            # 更新缓存
+            self._next_action_cache = next_action
+            self._next_action_cache_time = time.time()
         return next_action
 
     def _save_sign_history(self, sign_data):
@@ -696,7 +702,7 @@ class HdhiveSignFixed(_PluginBase):
                 'Authorization': f'Bearer {token}',
             }
             resp = requests.get(self._user_info_api, headers=headers, cookies=cookies, proxies=settings.PROXY, timeout=30, verify=False)
-            logger.debug(f"拉取用户信息 请求地址：{self._user_info_api},headers: {str(headers)},返回：{resp.text}")
+            #logger.debug(f"拉取用户信息 请求地址：{self._user_info_api},headers: {str(headers)},返回：{resp.text}")
             logger.info(f"拉取用户信息 API 状态码: {getattr(resp,'status_code','unknown')} CT: {getattr(resp.headers,'get',lambda k:'' )('Content-Type')}")
             data = {}
             try:
