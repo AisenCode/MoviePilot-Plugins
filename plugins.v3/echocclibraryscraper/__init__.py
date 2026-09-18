@@ -14,14 +14,15 @@ from app.sdk.media import MetaInfoPath
 from app.db.oper.transferhistory import TransferHistoryOper
 from app.sdk.media import NfoReader
 from app.sdk.logging import logger
-from app.plugins import _PluginBase
+from app.sdk.plugin import _PluginBase
 from app.schemas import MediaSource, MediaType
 from app.sdk.media import resolve_media_identity
 from app.sdk.utilities import SystemUtils
 
-# ── 新增导入：SQLAlchemy ORM 与索引 ──
-from sqlalchemy import Column, DateTime, Index, String, select, delete
-from sqlalchemy.orm import DeclarativeBase
+# ── 新增导入：SQLAlchemy ORM、索引与 V3 插件自有库基类 ──
+from sqlalchemy import DateTime, Index, String, select, delete
+from sqlalchemy.orm import Mapped, mapped_column
+from app.sdk.database import plugin_declarative_base
 
 
 class EchoCCLibraryScraper(_PluginBase):
@@ -62,7 +63,7 @@ class EchoCCLibraryScraper(_PluginBase):
 
     # ── 新增：增量刮削相关 ──
     _incremental_scrape: bool = False   # 增量开关，默认关闭
-    _db_engine = None                   # 数据库引擎（延迟初始化）
+    _db_handle = None                   # 插件自有数据库句柄（延迟初始化）
 
     # ═══════════════════════════════════════════════════════════
     #  生命周期
@@ -124,23 +125,32 @@ class EchoCCLibraryScraper(_PluginBase):
     # ═══════════════════════════════════════════════════════════
     #  数据库操作
     # ═══════════════════════════════════════════════════════════
+    def get_database_models(self):
+        """
+        声明插件自有数据库模型（V3 契约）。
+        宿主在 init_plugin() 返回后读取本声明并自动建表；
+        增量刮削未启用时不声明，不产生任何库文件。
+        """
+        if self._incremental_scrape:
+            return [ScrapedRecord]
+        return None
+
     def _init_database(self):
-        """初始化已刮削记录表（幂等操作）"""
+        """初始化插件自有数据库句柄（幂等操作）"""
         try:
-            # 通过 SDK 获取插件数据目录下的数据库引擎
-            # 请将 get_db_engine() 替换为实际 SDK 提供的方法
-            self._db_engine = self.get_db_engine()
-            Base.metadata.create_all(self._db_engine)
+            # V3 插件自有库：宿主按 get_database_models() 自动建表，
+            # 这里仅获取会话句柄（不存在时按需建立）
+            self._db_handle = self.get_database()
             logger.info("媒体库刮削：已刮削记录表初始化完成")
         except Exception as e:
             logger.error(f"媒体库刮削：初始化数据库失败 - {e}")
 
     def _is_scraped(self, media_path: str) -> bool:
         """查询该路径是否已完成刮削（走主键索引，O(log n)）"""
-        if not self._incremental_scrape or not self._db_engine:
+        if not self._incremental_scrape or not self._db_handle:
             return False
         try:
-            with self.get_db_session() as session:
+            with self._db_handle.session() as session:
                 stmt = (
                     select(ScrapedRecord)
                     .where(ScrapedRecord.media_path == str(media_path))
@@ -154,10 +164,10 @@ class EchoCCLibraryScraper(_PluginBase):
 
     def _mark_scraped(self, media_path: str, media_type: str = None, tmdb_id: str = None):
         """刮削成功后写入记录（主键冲突时自动忽略）"""
-        if not self._incremental_scrape or not self._db_engine:
+        if not self._incremental_scrape or not self._db_handle:
             return
         try:
-            with self.get_db_session() as session:
+            with self._db_handle.session() as session:
                 record = ScrapedRecord(
                     media_path=str(media_path),
                     media_type=media_type,
@@ -170,10 +180,10 @@ class EchoCCLibraryScraper(_PluginBase):
 
     def _clear_records(self) -> Tuple[bool, str]:
         """清空全部记录，保留表结构和索引"""
-        if not self._db_engine:
+        if not self._db_handle:
             return True, "记录表未初始化，无需清理"
         try:
-            with self.get_db_session() as session:
+            with self._db_handle.session() as session:
                 count = session.query(ScrapedRecord).count()
                 session.execute(delete(ScrapedRecord))
                 session.commit()
@@ -373,7 +383,7 @@ class EchoCCLibraryScraper(_PluginBase):
                                     'text': '清空已刮削记录',
                                     'events': {
                                         'click': {
-                                            'api': 'plugin/LibraryScraper/clear_records',
+                                            'api': 'plugin/EchoCCLibraryScraper/clear_records',
                                             'method': 'get',
                                             'confirm': '确定要清空全部已刮削记录吗？\n'
                                                        '清空后下次运行将重新全量扫描，此操作不可恢复！'
@@ -547,10 +557,10 @@ class EchoCCLibraryScraper(_PluginBase):
             relative_parts = Path(relative_path).parts
             if len(relative_parts) > rename_format_level:
                 media_path = scraper_path.joinpath(*relative_parts[:-rename_format_level])
-                return media_path, mtype, LibraryScraper._target_dir, media_source, media_id
+                return media_path, mtype, EchoCCLibraryScraper._target_dir, media_source, media_id
 
         # 扁平目录或自定义重命名格式无目录层级时，退回到单文件刮削
-        return file_path, mtype, LibraryScraper._target_file, media_source, media_id
+        return file_path, mtype, EchoCCLibraryScraper._target_file, media_source, media_id
 
     @staticmethod
     def __contains_scrape_item(
@@ -641,7 +651,7 @@ class EchoCCLibraryScraper(_PluginBase):
             if target_type == self._target_dir:
                 self.__scrape_child_files(path=path, mtype=mtype)
                 return
-            logger.warn(f"未识别到媒体信息：{path}")
+            logger.warning(f"未识别到媒体信息：{path}")
             return
 
         if not settings.SCRAP_FOLLOW_TMDB:
@@ -678,7 +688,7 @@ class EchoCCLibraryScraper(_PluginBase):
         """分类目录无法作为单个媒体识别时，继续按目录内的媒体文件逐个刮削。"""
         child_files = SystemUtils.list_files(path, settings.RMT_MEDIAEXT)
         if not child_files:
-            logger.warn(f"未识别到媒体信息：{path}")
+            logger.warning(f"未识别到媒体信息：{path}")
             return
 
         logger.info(f"{path} 可能是分类目录，开始刮削目录内媒体文件 ...")
@@ -738,7 +748,7 @@ class EchoCCLibraryScraper(_PluginBase):
                     if media_source:
                         return media_source, media_id
         except Exception as err:
-            logger.warn(f"从 NFO 文件中获取媒体身份失败：{str(err)}")
+            logger.warning(f"从 NFO 文件中获取媒体身份失败：{str(err)}")
 
         return None, None
 
@@ -760,23 +770,20 @@ class EchoCCLibraryScraper(_PluginBase):
 # ═══════════════════════════════════════════════════════════════
 #  ORM 模型：已刮削记录表
 # ═══════════════════════════════════════════════════════════════
-class Base(DeclarativeBase):
-    """插件自有表的 ORM 基类"""
-    pass
-
-
-class ScrapedRecord(Base):
+class ScrapedRecord(plugin_declarative_base()):
     """
-    已刮削记录表。
+    已刮削记录表（插件自有库，V3 规范）。
     media_path 作为主键，自带唯一索引，查询复杂度 O(log n)。
     额外建立 tmdb_id、scrape_time 索引，便于反查与历史清理。
+    基类由 app.sdk.database.plugin_declarative_base() 产出，每次热重载
+    都会拿到全新的 MetaData，表不会与宿主或其它插件冲突。
     """
     __tablename__ = "libraryscraper_scraped_records"
 
-    media_path = Column(String, primary_key=True, comment="刮削目标路径")
-    media_type = Column(String, nullable=True, comment="movie / tv")
-    tmdb_id = Column(String, nullable=True, comment="TMDB ID")
-    scrape_time = Column(DateTime, default=datetime.now, comment="刮削完成时间")
+    media_path: Mapped[str] = mapped_column(String, primary_key=True, comment="刮削目标路径")
+    media_type: Mapped[Optional[str]] = mapped_column(String, nullable=True, comment="movie / tv")
+    tmdb_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, comment="TMDB ID")
+    scrape_time: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, comment="刮削完成时间")
 
     __table_args__ = (
         Index("idx_libscraper_tmdb", "tmdb_id"),
