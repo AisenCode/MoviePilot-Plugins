@@ -3,6 +3,9 @@ from pathlib import Path
 from threading import Event
 from typing import List, Tuple, Dict, Any, Optional
 
+import os
+import re
+
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -14,26 +17,21 @@ from app.sdk.media import MetaInfoPath
 from app.db.oper.transferhistory import TransferHistoryOper
 from app.sdk.media import NfoReader
 from app.sdk.logging import logger
-from app.sdk.plugin import _PluginBase
+from app.plugins import _PluginBase
 from app.schemas import MediaSource, MediaType
 from app.sdk.media import resolve_media_identity
 from app.sdk.utilities import SystemUtils
-
-# ── 新增导入：SQLAlchemy ORM、索引与 V3 插件自有库基类 ──
-from sqlalchemy import DateTime, Index, String, select, delete
-from sqlalchemy.orm import Mapped, mapped_column
-from app.sdk.database import plugin_declarative_base
 
 
 class EchoCCLibraryScraper(_PluginBase):
     # 插件名称
     plugin_name = "媒体库刮削专享版"
     # 插件描述
-    plugin_desc = "定时对媒体库进行刮削，补齐缺失元数据和图片。"
+    plugin_desc = "定时对媒体库进行刮削，补齐缺失元数据和图片。按系统刮削开关判断旁车文件是否完整以跳过已刮项，支持仅刮削指定时间之后更新的文件，并优化大库遍历速度。"
     # 插件图标
     plugin_icon = "scraper.png"
     # 插件版本
-    plugin_version = "3.2.1"
+    plugin_version = "3.2.2"
     # 插件作者
     plugin_author = "jxxghp,aisen"
     # 作者主页
@@ -55,21 +53,17 @@ class EchoCCLibraryScraper(_PluginBase):
     _mode = ""
     _scraper_paths = ""
     _exclude_paths = ""
+    # 仅刮削该时间之后更新的文件（原始字符串与解析后的时间戳）
+    _mtime_after_raw = ""
+    _mtime_after: Optional[float] = None
     # 退出事件
     _event = Event()
     # 刮削目标类型
     _target_dir = "dir"
     _target_file = "file"
 
-    # ── 新增：增量刮削相关 ──
-    _incremental_scrape: bool = False   # 增量开关，默认关闭
-    _db_handle = None                   # 插件自有数据库句柄（延迟初始化）
-
-    # ═══════════════════════════════════════════════════════════
-    #  生命周期
-    # ═══════════════════════════════════════════════════════════
     def init_plugin(self, config: dict = None):
-        """初始化插件，读取配置并按需初始化数据库"""
+
         # 读取配置
         if config:
             self._enabled = config.get("enabled")
@@ -78,27 +72,22 @@ class EchoCCLibraryScraper(_PluginBase):
             self._mode = config.get("mode") or ""
             self._scraper_paths = config.get("scraper_paths") or ""
             self._exclude_paths = config.get("exclude_paths") or ""
-            # ★ 新增：读取增量开关，默认 False
-            self._incremental_scrape = config.get("incremental_scrape", False)
-
-        # ★ 增量开关打开时初始化数据库
-        if self._incremental_scrape:
-            self._init_database()
+            # 仅刮削指定时间之后更新的文件
+            self._mtime_after_raw = config.get("mtime_after") or ""
+            self._mtime_after = self._parse_mtime_after(self._mtime_after_raw)
 
         # 停止现有任务
         self.stop_service()
 
         # 启动定时任务 & 立即运行一次
         if self._enabled or self._onlyonce:
+
             if self._onlyonce:
                 logger.info(f"媒体库刮削服务，立即运行一次")
                 self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-                self._scheduler.add_job(
-                    func=self.__libraryscraper,
-                    trigger='date',
-                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                    name="媒体库刮削"
-                )
+                self._scheduler.add_job(func=self.__libraryscraper, trigger='date',
+                                        run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                        name="媒体库刮削")
                 # 关闭一次性开关
                 self._onlyonce = False
                 self.update_config({
@@ -108,12 +97,12 @@ class EchoCCLibraryScraper(_PluginBase):
                     "mode": self._mode,
                     "scraper_paths": self._scraper_paths,
                     "exclude_paths": self._exclude_paths,
-                    "incremental_scrape": self._incremental_scrape,
+                    "mtime_after": self._mtime_after_raw
                 })
-            if self._scheduler and self._scheduler.get_jobs():
-                # 启动服务
-                self._scheduler.print_jobs()
-                self._scheduler.start()
+                if self._scheduler.get_jobs():
+                    # 启动服务
+                    self._scheduler.print_jobs()
+                    self._scheduler.start()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -122,98 +111,20 @@ class EchoCCLibraryScraper(_PluginBase):
     def get_command() -> List[Dict[str, Any]]:
         pass
 
-    # ═══════════════════════════════════════════════════════════
-    #  数据库操作
-    # ═══════════════════════════════════════════════════════════
-    def get_database_models(self):
-        """
-        声明插件自有数据库模型（V3 契约）。
-        宿主在 init_plugin() 返回后读取本声明并自动建表；
-        增量刮削未启用时不声明，不产生任何库文件。
-        """
-        if self._incremental_scrape:
-            return [ScrapedRecord]
-        return None
-
-    def _init_database(self):
-        """初始化插件自有数据库句柄（幂等操作）"""
-        try:
-            # V3 插件自有库：宿主按 get_database_models() 自动建表，
-            # 这里仅获取会话句柄（不存在时按需建立）
-            self._db_handle = self.get_database()
-            logger.info("媒体库刮削：已刮削记录表初始化完成")
-        except Exception as e:
-            logger.error(f"媒体库刮削：初始化数据库失败 - {e}")
-
-    def _is_scraped(self, media_path: str) -> bool:
-        """查询该路径是否已完成刮削（走主键索引，O(log n)）"""
-        if not self._incremental_scrape or not self._db_handle:
-            return False
-        try:
-            with self._db_handle.session() as session:
-                stmt = (
-                    select(ScrapedRecord)
-                    .where(ScrapedRecord.media_path == str(media_path))
-                    .limit(1)
-                )
-                result = session.execute(stmt).scalar_one_or_none()
-                return result is not None
-        except Exception as e:
-            logger.error(f"媒体库刮削：查询已刮削记录失败 - {e}")
-            return False
-
-    def _mark_scraped(self, media_path: str, media_type: str = None, tmdb_id: str = None):
-        """刮削成功后写入记录（主键冲突时自动忽略）"""
-        if not self._incremental_scrape or not self._db_handle:
-            return
-        try:
-            with self._db_handle.session() as session:
-                record = ScrapedRecord(
-                    media_path=str(media_path),
-                    media_type=media_type,
-                    tmdb_id=str(tmdb_id) if tmdb_id else None,
-                )
-                session.merge(record)  # merge 等效于 INSERT OR IGNORE
-                session.commit()
-        except Exception as e:
-            logger.error(f"媒体库刮削：写入已刮削记录失败 - {e}")
-
-    def _clear_records(self) -> Tuple[bool, str]:
-        """清空全部记录，保留表结构和索引"""
-        if not self._db_handle:
-            return True, "记录表未初始化，无需清理"
-        try:
-            with self._db_handle.session() as session:
-                count = session.query(ScrapedRecord).count()
-                session.execute(delete(ScrapedRecord))
-                session.commit()
-            logger.info(f"媒体库刮削：已清空 {count} 条刮削记录")
-            return True, f"已清空 {count} 条记录"
-        except Exception as e:
-            logger.error(f"媒体库刮削：清空记录失败 - {e}")
-            return False, str(e)
-
-    # ═══════════════════════════════════════════════════════════
-    #  API 注册
-    # ═══════════════════════════════════════════════════════════
     def get_api(self) -> List[Dict[str, Any]]:
-        return [{
-            "path": "/clear_records",
-            "endpoint": self.api_clear_records,
-            "methods": ["GET"],
-            "summary": "清空已刮削记录",
-        }]
+        pass
 
-    def api_clear_records(self):
-        """清空接口：成功返回 code 0，失败返回错误信息"""
-        ok, msg = self._clear_records()
-        return {"code": 0 if ok else 1, "msg": msg}
-
-    # ═══════════════════════════════════════════════════════════
-    #  公共服务
-    # ═══════════════════════════════════════════════════════════
     def get_service(self) -> List[Dict[str, Any]]:
-        """注册插件公共服务"""
+        """
+        注册插件公共服务
+        [{
+            "id": "服务ID",
+            "name": "服务名称",
+            "trigger": "触发器：cron/interval/date/CronTrigger.from_crontab()",
+            "func": self.xxx,
+            "kwargs": {} # 定时器参数
+        }]
+        """
         if self._enabled and self._cron:
             return [{
                 "id": "LibraryScraper",
@@ -232,259 +143,245 @@ class EchoCCLibraryScraper(_PluginBase):
             }]
         return []
 
-    # ═══════════════════════════════════════════════════════════
-    #  配置表单
-    # ═══════════════════════════════════════════════════════════
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
             {
                 'component': 'VForm',
                 'content': [
-                    # ── 第一行：启用插件 / 立即运行一次 ──
                     {
                         'component': 'VRow',
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [{
-                                    'component': 'VSwitch',
-                                    'props': {'model': 'enabled', 'label': '启用插件'}
-                                }]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [{
-                                    'component': 'VSwitch',
-                                    'props': {'model': 'onlyonce', 'label': '立即运行一次'}
-                                }]
-                            }
-                        ]
-                    },
-                    # ── 第二行：覆盖模式 / 执行周期 ──
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [{
-                                    'component': 'VSelect',
-                                    'props': {
-                                        'model': 'mode',
-                                        'label': '覆盖模式',
-                                        'items': [
-                                            {'title': '不覆盖已有元数据', 'value': ''},
-                                            {'title': '覆盖所有元数据和图片', 'value': 'force_all'},
-                                        ]
-                                    }
-                                }]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [{
-                                    'component': 'VCronField',
-                                    'props': {
-                                        'model': 'cron',
-                                        'label': '执行周期',
-                                        'placeholder': '5位cron表达式，留空自动'
-                                    }
-                                }]
-                            }
-                        ]
-                    },
-                    # ── 第三行：刮削路径 ──
-                    {
-                        'component': 'VRow',
-                        'content': [{
-                            'component': 'VCol',
-                            'props': {'cols': 12},
-                            'content': [{
-                                'component': 'VTextarea',
                                 'props': {
-                                    'model': 'scraper_paths',
-                                    'label': '削刮路径',
-                                    'rows': 5,
-                                    'placeholder': '每一行一个目录'
-                                }
-                            }]
-                        }]
-                    },
-                    # ── 第四行：排除路径 ──
-                    {
-                        'component': 'VRow',
-                        'content': [{
-                            'component': 'VCol',
-                            'props': {'cols': 12},
-                            'content': [{
-                                'component': 'VTextarea',
-                                'props': {
-                                    'model': 'exclude_paths',
-                                    'label': '排除路径',
-                                    'rows': 2,
-                                    'placeholder': '每一行一个目录'
-                                }
-                            }]
-                        }]
-                    },
-                    # ── 第五行：提示信息 ──
-                    {
-                        'component': 'VRow',
-                        'content': [{
-                            'component': 'VCol',
-                            'props': {'cols': 12},
-                            'content': [{
-                                'component': 'VAlert',
-                                'props': {
-                                    'type': 'info',
-                                    'variant': 'tonal',
-                                    'text': '刮削路径后拼接#电视剧/电影，强制指定该媒体路径媒体类型。'
-                                            '不加默认根据文件名自动识别媒体类型。'
-                                }
-                            }]
-                        }]
-                    },
-                    # ═══════════════════════════════════════════
-                    #  ★ 新增：增量刮削开关 + 清除按钮
-                    # ═══════════════════════════════════════════
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            # 增量开关（默认关闭）
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [{
-                                    'component': 'VSwitch',
-                                    'props': {
-                                        'model': 'incremental_scrape',
-                                        'label': '启用增量刮削',
-                                        'hint': '开启后仅刮削新增/未记录的媒体，跳过已完成的，'
-                                                '大幅减少大媒体库的遍历与刮削耗时。',
-                                        'persistent-hint': True,
-                                        'color': 'primary'
-                                    }
-                                }]
-                            },
-                            # 清除按钮（点击弹窗二次确认）
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [{
-                                    'component': 'VBtn',
-                                    'props': {
-                                        'color': 'error',
-                                        'variant': 'outlined',
-                                        'block': True,
-                                        'prepend-icon': 'mdi-delete-sweep'
-                                    },
-                                    'text': '清空已刮削记录',
-                                    'events': {
-                                        'click': {
-                                            'api': 'plugin/EchoCCLibraryScraper/clear_records',
-                                            'method': 'get',
-                                            'confirm': '确定要清空全部已刮削记录吗？\n'
-                                                       '清空后下次运行将重新全量扫描，此操作不可恢复！'
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enabled',
+                                            'label': '启用插件',
                                         }
                                     }
-                                }]
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'onlyonce',
+                                            'label': '立即运行一次',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'mode',
+                                            'label': '覆盖模式',
+                                            'items': [
+                                                {'title': '不覆盖已有元数据', 'value': ''},
+                                                {'title': '覆盖所有元数据和图片', 'value': 'force_all'},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VCronField',
+                                        'props': {
+                                            'model': 'cron',
+                                            'label': '执行周期',
+                                            'placeholder': '5位cron表达式，留空自动'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'scraper_paths',
+                                            'label': '削刮路径',
+                                            'rows': 5,
+                                            'placeholder': '每一行一个目录'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'exclude_paths',
+                                            'label': '排除路径',
+                                            'rows': 2,
+                                            'placeholder': '每一行一个目录'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [{
+                            'component': 'VCol',
+                            'props': {'cols': 12},
+                            'content': [{
+                                'component': 'VTextField',
+                                'props': {
+                                    'model': 'mtime_after',
+                                    'label': '仅刮削该时间之后更新的文件',
+                                    'placeholder': '留空则不限制，格式：2026-09-01 12:00:00',
+                                    'hint': '只处理修改时间晚于该时间的媒体文件，用于只刮削新增/更新内容；留空处理全部。',
+                                    'persistent-hint': True,
+                                }
+                            }]
+                        }]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '刮削路径后拼接#电视剧/电影，强制指定该媒体路径媒体类型。'
+                                                    '不加默认根据文件名自动识别媒体类型。'
+                                        }
+                                    }
+                                ]
                             }
                         ]
                     }
                 ]
             }
         ], {
-            # ── 默认配置 ──
             "enabled": False,
             "onlyonce": False,
             "cron": "0 0 */7 * *",
             "mode": "",
             "scraper_paths": "",
             "exclude_paths": "",
-            "incremental_scrape": False,   # ★ 增量刮削默认关闭
+            "mtime_after": ""
         }
 
     def get_page(self) -> List[dict]:
         pass
 
-    # ═══════════════════════════════════════════════════════════
-    #  核心刮削逻辑
-    # ═══════════════════════════════════════════════════════════
     def __libraryscraper(self):
-        """开始刮削媒体库"""
+        """
+        开始刮削媒体库
+        """
         if not self._scraper_paths:
             return
-
-        # 排除目录
-        exclude_paths = self._exclude_paths.split("\n")
+        # 排除目录（循环外一次性构建 Path，遍历时直接剪枝）
+        exclude_dirs = [Path(p) for p in self._exclude_paths.split("\n") if p and p.strip()]
         # 已选择的目录
         paths = self._scraper_paths.split("\n")
         # 需要刮削的媒体目录或文件
         scraper_paths = []
-
+        scraper_keys = set()
         for path in paths:
             if not path:
                 continue
-
             # 强制指定该路径媒体类型
             mtype = None
             if str(path).count("#") == 1:
                 mtype = next(
-                    (mediaType for mediaType in MediaType.__members__.values()
-                     if mediaType.value == path.split("#")[1]),
-                    None
-                )
-                path = path.split("#")[0]
-
+                    (mediaType for mediaType in MediaType.__members__.values() if
+                     mediaType.value == str(str(path).split("#")[1])),
+                    None)
+                path = str(path).split("#")[0]
+            # 判断路径是否存在
             scraper_path = Path(path)
             if not scraper_path.exists():
-                logger.error(f"媒体库刮削：刮削路径不存在 - {path}")
+                logger.warning(f"媒体库刮削路径不存在：{path}")
                 continue
-
-            # 遍历媒体库文件
-            for file_path in SystemUtils.list_files(scraper_path, settings.RMT_MEDIAEXT):
+            logger.info(f"开始检索目录：{path} {mtype} ...")
+            # 遍历所有文件（排除目录在遍历时直接剪枝，不再下钻其下文件）
+            files = self._list_media_files(scraper_path, exclude_dirs)
+            for file_path in files:
                 if self._event.is_set():
-                    logger.info(f"媒体库刮削：服务停止")
+                    logger.info(f"媒体库刮削服务停止")
                     return
-
-                # 检查排除目录
-                exclude_flag = False
-                for exclude_path in exclude_paths:
-                    if not exclude_path:
-                        continue
+                # 仅处理指定时间之后更新的文件（留空则不过滤）
+                if self._mtime_after is not None:
                     try:
-                        if file_path.is_relative_to(Path(exclude_path)):
-                            exclude_flag = True
-                            break
-                    except Exception as err:
-                        print(str(err))
-
-                if exclude_flag:
-                    logger.debug(f"{file_path} 在排除目录中，跳过 ...")
-                    continue
-
-                # 强制类型匹配检查
+                        if file_path.stat().st_mtime < self._mtime_after:
+                            continue
+                    except OSError:
+                        continue
                 if mtype and not self.__match_forced_type_path(
-                    file_path=file_path,
-                    scraper_path=scraper_path,
-                    mtype=mtype
+                        file_path=file_path,
+                        scraper_path=scraper_path,
+                        mtype=mtype
                 ):
                     logger.debug(f"{file_path} 不属于强制指定的{mtype.value}目录，跳过 ...")
                     continue
-
-                # 识别是电影还是电视剧
+                # 识别是电影还是电视剧，强制类型只作为默认值，不污染后续文件识别结果
                 file_meta = MetaInfoPath(file_path)
                 file_mtype = mtype
                 if not file_mtype:
                     file_mtype = file_meta.type
-                if file_mtype == MediaType.UNKNOWN:
-                    file_mtype = self.__infer_type_from_path(
-                        file_path=file_path,
-                        scraper_path=scraper_path
-                    )
-
+                    if file_mtype == MediaType.UNKNOWN:
+                        file_mtype = self.__infer_type_from_path(file_path=file_path, scraper_path=scraper_path)
                 scraper_item = self.__get_scrape_item(
                     file_path=file_path,
                     scraper_path=scraper_path,
@@ -492,20 +389,16 @@ class EchoCCLibraryScraper(_PluginBase):
                     media_source=file_meta.media_source,
                     media_id=file_meta.media_id,
                 )
-
-                if scraper_item and not self.__contains_scrape_item(scraper_paths, scraper_item):
-                    # ★ 增量模式下：已刮削的直接跳过
-                    if self._incremental_scrape and self._is_scraped(str(scraper_item[0])):
-                        logger.debug(f"媒体库刮削：跳过已刮削目标 - {scraper_item[0]}")
-                        continue
-
-                    logger.info(f"媒体库刮削：发现刮削目标 - {scraper_item[0]}")
-                    scraper_paths.append(scraper_item)
-
+                if scraper_item:
+                    item_key = (str(scraper_item[0]), scraper_item[1].value, scraper_item[2])
+                    if item_key not in scraper_keys:
+                        scraper_keys.add(item_key)
+                        logger.info(f"发现刮削目标：{scraper_item}")
+                        scraper_paths.append(scraper_item)
         # 开始刮削
         if scraper_paths:
             for item in scraper_paths:
-                logger.info(f"媒体库刮削：开始刮削目标 - {item[0]} ...")
+                logger.info(f"开始刮削目标：{item[0]} ...")
                 self.__scrape_path(
                     path=item[0],
                     mtype=item[1],
@@ -513,26 +406,16 @@ class EchoCCLibraryScraper(_PluginBase):
                     media_source=item[3],
                     media_id=item[4],
                 )
-                # ★ 刮削成功后写入数据库
-                if self._incremental_scrape:
-                    self._mark_scraped(
-                        media_path=str(item[0]),
-                        media_type=item[1].value if item[1] else None,
-                        tmdb_id=item[4] if item[3] == MediaSource.TMDB else None,
-                    )
         else:
-            logger.info(f"媒体库刮削：未发现需要刮削的目录")
+            logger.info(f"未发现需要刮削的目录")
 
-    # ═══════════════════════════════════════════════════════════
-    #  工具方法（保持原有逻辑不变）
-    # ═══════════════════════════════════════════════════════════
     @staticmethod
     def __get_scrape_item(
-        file_path: Path,
-        scraper_path: Path,
-        mtype: MediaType,
-        media_source: Optional[MediaSource] = None,
-        media_id: Optional[str] = None,
+            file_path: Path,
+            scraper_path: Path,
+            mtype: MediaType,
+            media_source: Optional[MediaSource] = None,
+            media_id: Optional[str] = None,
     ) -> Optional[Tuple[Path, MediaType, str, Optional[MediaSource], Optional[str]]]:
         """
         根据扫描根目录和重命名格式，计算真正需要刮削的媒体目录。
@@ -541,13 +424,8 @@ class EchoCCLibraryScraper(_PluginBase):
         if not file_path or not scraper_path or not mtype:
             return None
 
-        rename_format = (
-            settings.TV_RENAME_FORMAT
-            if mtype == MediaType.TV
-            else settings.MOVIE_RENAME_FORMAT
-        )
+        rename_format = settings.TV_RENAME_FORMAT if mtype == MediaType.TV else settings.MOVIE_RENAME_FORMAT
         rename_format_level = len(rename_format.strip("/").split("/")) - 1
-
         try:
             relative_path = file_path.relative_to(scraper_path)
         except ValueError:
@@ -555,22 +433,61 @@ class EchoCCLibraryScraper(_PluginBase):
 
         if rename_format_level >= 1:
             relative_parts = Path(relative_path).parts
+            # 重命名格式中包含几层目录，就从文件往上取几层目录；前缀分类目录不会参与计算。
             if len(relative_parts) > rename_format_level:
                 media_path = scraper_path.joinpath(*relative_parts[:-rename_format_level])
                 return media_path, mtype, EchoCCLibraryScraper._target_dir, media_source, media_id
 
-        # 扁平目录或自定义重命名格式无目录层级时，退回到单文件刮削
+        # 扁平目录或自定义重命名格式无目录层级时，退回到单文件刮削，避免分类目录识别失败。
         return file_path, mtype, EchoCCLibraryScraper._target_file, media_source, media_id
 
     @staticmethod
-    def __contains_scrape_item(
-        scraper_paths: List[Tuple[Path, MediaType, str, Optional[MediaSource], Optional[str]]],
-        scraper_item: Tuple[Path, MediaType, str, Optional[MediaSource], Optional[str]],
-    ) -> bool:
+    def _is_relative_to(path: Path, base: Path) -> bool:
+        """路径包含判断，相对路径或异常时按 False 处理。"""
+        try:
+            return path.is_relative_to(base)
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _list_media_files(directory: Path, exclude_dirs: List[Path]) -> List[Path]:
         """
-        判断刮削目标是否已存在；同一目标只刮削一次。
+        递归收集目录下的媒体文件，扩展名过滤规则与 SystemUtils.list_files 一致，
+        并在遍历时直接跳过排除目录，避免对排除子树做无意义的磁盘遍历。
         """
-        return any(item[:3] == scraper_item[:3] for item in scraper_paths)
+        if not directory or not directory.exists():
+            return []
+        if directory.is_file():
+            return [directory]
+        # 扫描根目录本身在排除范围内则直接返回
+        if any(EchoCCLibraryScraper._is_relative_to(directory, ex_dir) for ex_dir in exclude_dirs):
+            return []
+
+        pattern = re.compile(r".*(" + "|".join(settings.RMT_MEDIAEXT) + r")$", re.IGNORECASE)
+        files = []
+
+        def _scan(dir_path: Path):
+            try:
+                with os.scandir(dir_path) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_file(follow_symlinks=False):
+                                if pattern.match(entry.name):
+                                    files.append(Path(entry.path))
+                            elif entry.is_dir(follow_symlinks=False):
+                                child = Path(entry.path)
+                                # 排除目录直接剪枝，不再下钻
+                                if any(EchoCCLibraryScraper._is_relative_to(child, ex_dir)
+                                       for ex_dir in exclude_dirs):
+                                    continue
+                                _scan(child)
+                        except (OSError, PermissionError):
+                            continue
+            except (OSError, PermissionError):
+                pass
+
+        _scan(directory)
+        return files
 
     @staticmethod
     def __match_forced_type_path(file_path: Path, scraper_path: Path, mtype: MediaType) -> bool:
@@ -579,12 +496,10 @@ class EchoCCLibraryScraper(_PluginBase):
         """
         if mtype not in (MediaType.MOVIE, MediaType.TV):
             return True
-
         try:
             relative_parts = file_path.relative_to(scraper_path).parts
         except ValueError:
             return True
-
         media_type_parts = {MediaType.MOVIE.value, MediaType.TV.value}.intersection(relative_parts)
         return not media_type_parts or mtype.value in media_type_parts
 
@@ -597,28 +512,123 @@ class EchoCCLibraryScraper(_PluginBase):
             relative_parts = file_path.relative_to(scraper_path).parts
         except ValueError:
             relative_parts = file_path.parts
-
         if MediaType.TV.value in relative_parts:
             return MediaType.TV
         if MediaType.MOVIE.value in relative_parts:
             return MediaType.MOVIE
         return MediaType.UNKNOWN
 
+    @staticmethod
+    def _target_sidecar_scope(
+            path: Path,
+            mtype: MediaType,
+            target_type: str,
+            target_dir: str,
+    ) -> Tuple[str, Path, str]:
+        """根据目标类型和刮削粒度，换算宿主刮削配置的 target 键、旁车所在目录与文件名主干。"""
+        if mtype == MediaType.MOVIE:
+            if target_type == target_dir:
+                # 电影目录：旁车在目录内，NFO 与目录同名或 movie.nfo
+                return "movie", path, path.name
+            # 电影单文件：旁车在视频同目录，NFO 与视频同名
+            return "movie", path.parent, path.stem
+        if mtype == MediaType.TV:
+            if target_type != target_dir:
+                # 剧集单文件：旁车在视频同目录，NFO/缩略图与集同名
+                return "episode", path.parent, path.stem
+            # 电视剧根目录：旁车在目录内（tvshow.nfo + 根图）
+            return "tv", path, path.name
+        return "", Path(""), ""
+
+    @staticmethod
+    def _parse_mtime_after(value: Optional[str]) -> Optional[float]:
+        """解析时间起点字符串（按系统本地时区），留空或格式错误返回 None（不限制）。"""
+        if not value or not str(value).strip():
+            return None
+        text = str(value).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(text, fmt)
+                return pytz.timezone(settings.TZ).localize(dt).timestamp()
+            except ValueError:
+                continue
+        logger.warning(f"媒体库刮削：无法解析时间 '{value}'，已忽略该时间过滤")
+        return None
+
+    def _is_scrape_complete(self, path: Path, mtype: MediaType, target_type: str) -> bool:
+        """
+        根据系统刮削开关配置，判断目标的必需旁车文件是否都已落盘。
+        全部存在返回 True（可跳过本次网络刮削）；任一缺失返回 False。
+        异常或配置不可用时按“未完成”处理（宁多刮一次，不误判跳过）。
+        """
+        target, base_dir, stem = self._target_sidecar_scope(
+            path=path,
+            mtype=mtype,
+            target_type=target_type,
+            target_dir=self._target_dir,
+        )
+        if not target:
+            return False
+
+        try:
+            policies = ScrapingChain().scraping_policies
+            if not policies:
+                return False
+            files = {p.name.lower() for p in base_dir.iterdir() if p.is_file()}
+        except Exception as err:
+            logger.debug(f"刮削完整性检查失败，按未完成处理：{err}")
+            return False
+
+        # NFO 候选文件名（按宿主落盘规则）
+        nfo_names = {
+            "movie": [f"{stem}.nfo", "movie.nfo"],
+            "tv": ["tvshow.nfo"],
+            "season": ["season.nfo"],
+            "episode": [f"{stem}.nfo"],
+        }.get(target, [])
+        if not policies.option(target, "nfo").is_skip:
+            if not any(name.lower() in files for name in nfo_names):
+                return False
+
+        # 图片类别 -> 旁车文件名关键字（大小写不敏感，目录内命中任一即视为存在）
+        image_keywords = {
+            "poster": ["poster"],
+            "backdrop": ["fanart", "backdrop", "background"],
+            "logo": ["logo"],
+            "disc": ["disc", "cdart", "discart"],
+            "banner": ["banner"],
+            "thumb": ["thumb", "landscape"],
+        }
+        for metadata, keywords in image_keywords.items():
+            option = policies.option(target, metadata)
+            if option.is_skip:
+                continue
+            if not any(any(kw in name for kw in keywords) for name in files):
+                return False
+
+        return True
+
     def __scrape_path(
-        self,
-        path: Path,
-        mtype: MediaType,
-        target_type: str = _target_dir,
-        media_source: Optional[MediaSource] = None,
-        media_id: Optional[str] = None,
+            self,
+            path: Path,
+            mtype: MediaType,
+            target_type: str = _target_dir,
+            media_source: Optional[MediaSource] = None,
+            media_id: Optional[str] = None,
     ):
-        """刮削一个媒体目录或媒体文件"""
+        """
+        刮削一个媒体目录或媒体文件
+        """
+        # 非覆盖模式下，旁车文件已按系统刮削配置齐全则跳过本次网络刮削
+        if not self._mode and self._is_scrape_complete(path, mtype, target_type):
+            logger.info(f"{path} 已按刮削配置完成，跳过")
+            return
+
         media_source, media_id = resolve_media_identity(
             media_source=media_source,
             media_id=media_id,
         )
-
-        # 优先读取本地 NFO 文件
+        # 优先读取本地 NFO 文件；NFO 无合法身份时保留文件路径中的统一身份。
         nfo_candidates = []
         if target_type == self._target_file:
             nfo_candidates.append(path.with_suffix(".nfo"))
@@ -626,7 +636,6 @@ class EchoCCLibraryScraper(_PluginBase):
             nfo_candidates.extend((path / "movie.nfo", path / (path.stem + ".nfo")))
         else:
             nfo_candidates.append(path / "tvshow.nfo")
-
         for nfo_path in nfo_candidates:
             if not nfo_path.exists():
                 continue
@@ -634,7 +643,6 @@ class EchoCCLibraryScraper(_PluginBase):
             if nfo_source:
                 media_source, media_id = nfo_source, nfo_media_id
                 break
-
         if media_source and media_id:
             logger.info(f"读取到本地 NFO 媒体身份：{media_source.value}:{media_id}")
             mediainfo = self.chain.recognize_media(
@@ -643,17 +651,19 @@ class EchoCCLibraryScraper(_PluginBase):
                 mtype=mtype,
             )
         else:
+            # 按名称识别
             meta = MetaInfoPath(path)
             meta.type = mtype
             mediainfo = self.chain.recognize_media(meta=meta)
-
         if not mediainfo:
             if target_type == self._target_dir:
+                # 目录名无法识别时，通常是分类目录，继续尝试其中的具体媒体文件。
                 self.__scrape_child_files(path=path, mtype=mtype)
                 return
-            logger.warning(f"未识别到媒体信息：{path}")
+            logger.warn(f"未识别到媒体信息：{path}")
             return
 
+        # 不跟随远端标题时，按统一媒体身份找回整理历史中的标题。
         if not settings.SCRAP_FOLLOW_TMDB:
             transfer_history = TransferHistoryOper().get_by_media_identity(
                 media_source=mediainfo.media_source,
@@ -662,13 +672,12 @@ class EchoCCLibraryScraper(_PluginBase):
             )
             if transfer_history:
                 mediainfo.title = transfer_history.title
-
+        # 获取图片
         self.chain.obtain_images(mediainfo)
-
+        # 刮削
         item_path = str(path).replace("\\", "/")
         if target_type == self._target_dir:
             item_path = f"{item_path}/"
-
         ScrapingChain().scrape_metadata(
             fileitem=schemas.FileItem(
                 storage="local",
@@ -685,23 +694,22 @@ class EchoCCLibraryScraper(_PluginBase):
         logger.info(f"{path} 刮削完成")
 
     def __scrape_child_files(self, path: Path, mtype: MediaType):
-        """分类目录无法作为单个媒体识别时，继续按目录内的媒体文件逐个刮削。"""
+        """
+        分类目录无法作为单个媒体识别时，继续按目录内的媒体文件逐个刮削。
+        """
         child_files = SystemUtils.list_files(path, settings.RMT_MEDIAEXT)
         if not child_files:
-            logger.warning(f"未识别到媒体信息：{path}")
+            logger.warn(f"未识别到媒体信息：{path}")
             return
-
         logger.info(f"{path} 可能是分类目录，开始刮削目录内媒体文件 ...")
         for child_file in child_files:
             if self._event.is_set():
                 logger.info(f"媒体库刮削服务停止")
                 return
-
             child_mtype = mtype
             child_meta = MetaInfoPath(child_file)
             if not child_mtype:
                 child_mtype = child_meta.type
-
             self.__scrape_path(
                 path=child_file,
                 mtype=child_mtype,
@@ -712,10 +720,14 @@ class EchoCCLibraryScraper(_PluginBase):
 
     @staticmethod
     def __get_media_identity_from_nfo(file_path: Path) -> Tuple[Optional[MediaSource], Optional[str]]:
-        """从 NFO 中读取第一个可识别的固定来源媒体身份。"""
+        """
+        从 NFO 中读取第一个可识别的固定来源媒体身份。
+
+        :param file_path: NFO 文件路径
+        :return: 媒体来源枚举与数据源原生 ID
+        """
         if not file_path:
             return None, None
-
         source_xpaths = {
             MediaSource.TMDB: (
                 "uniqueid[@type='Tmdb']",
@@ -736,7 +748,6 @@ class EchoCCLibraryScraper(_PluginBase):
                 "tvdbid",
             ),
         }
-
         try:
             reader = NfoReader(file_path)
             for source, xpaths in source_xpaths.items():
@@ -748,12 +759,13 @@ class EchoCCLibraryScraper(_PluginBase):
                     if media_source:
                         return media_source, media_id
         except Exception as err:
-            logger.warning(f"从 NFO 文件中获取媒体身份失败：{str(err)}")
-
+            logger.warn(f"从 NFO 文件中获取媒体身份失败：{str(err)}")
         return None, None
 
     def stop_service(self):
-        """退出插件"""
+        """
+        退出插件
+        """
         try:
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
@@ -764,30 +776,3 @@ class EchoCCLibraryScraper(_PluginBase):
                 self._scheduler = None
         except Exception as e:
             print(str(e))
-            
-            
- 
-# ═══════════════════════════════════════════════════════════════
-#  ORM 模型：已刮削记录表
-# ═══════════════════════════════════════════════════════════════
-class ScrapedRecord(plugin_declarative_base()):
-    """
-    已刮削记录表（插件自有库，V3 规范）。
-    media_path 作为主键，自带唯一索引，查询复杂度 O(log n)。
-    额外建立 tmdb_id、scrape_time 索引，便于反查与历史清理。
-    基类由 app.sdk.database.plugin_declarative_base() 产出，每次热重载
-    都会拿到全新的 MetaData，表不会与宿主或其它插件冲突。
-    """
-    __tablename__ = "libraryscraper_scraped_records"
-
-    media_path: Mapped[str] = mapped_column(String, primary_key=True, comment="刮削目标路径")
-    media_type: Mapped[Optional[str]] = mapped_column(String, nullable=True, comment="movie / tv")
-    tmdb_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, comment="TMDB ID")
-    scrape_time: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, comment="刮削完成时间")
-
-    __table_args__ = (
-        Index("idx_libscraper_tmdb", "tmdb_id"),
-        Index("idx_libscraper_time", "scrape_time"),
-        Index("idx_libscraper_type_time", "media_type", "scrape_time"),
-    )
-
